@@ -14,8 +14,8 @@ api-watch keeps a contract for every API response your app depends on. It re-che
 ## Quick start
 
 ```bash
-npx api-watch init users https://api.example.com/users/1 --out contracts.json
-npx api-watch check contracts.json
+node watch.mjs init users https://api.example.com/users/1 --out contracts.json
+node watch.mjs check contracts.json
 ```
 
 ```

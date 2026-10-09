@@ -39,7 +39,7 @@ When a field is renamed:
 ```
 api-watch check <contracts.json> [--json out.json] [--md out.md]
                 [--timeout 10000] [--fail-on breaking|warning]
-api-watch init <name> <url> [--out contracts.json]
+api-watch init <name> <url> [--out contracts.json] [--header "Name: ${ENV_VAR}"]...
 ```
 
 | Exit | Meaning |
@@ -65,15 +65,37 @@ api-watch init <name> <url> [--out contracts.json]
 
 Set `"array": true` when the response is a list. Fields are then checked against the first element.
 
+### Private APIs
+
+Add `"headers"` with `${ENV_VAR}` placeholders. The value is read from the environment when you run the check, so the secret never lives in `contracts.json`:
+
+```json
+{
+  "name": "me",
+  "url": "https://api.example.com/me",
+  "headers": { "Authorization": "Bearer ${API_TOKEN}" },
+  "expect": { "status": 200, "fields": { "id": "number" } }
+}
+```
+
+```bash
+API_TOKEN=... node watch.mjs check contracts.json
+node watch.mjs init me https://api.example.com/me --header 'Authorization: Bearer ${API_TOKEN}'
+```
+
+- If a variable is unset or empty, the check reports it as BREAKING and sends no request.
+- `init` refuses to save a literal value for credential headers (`Authorization`, `Cookie`, names containing `token`, `secret`, `key`). Use `${ENV_VAR}` instead.
+- Reports include the contract name, URL, status, and findings. They never include header values.
+
 ## Run it in CI
 
-`.github/workflows/api-watch.yml` runs the check every morning and uploads the report as an artifact. The job fails only on breaking changes by default.
+`.github/workflows/api-watch.yml` runs the check every morning and uploads the report as an artifact. The job fails only on breaking changes by default. For private APIs, pass credentials from repository secrets as environment variables, for example `env: { API_TOKEN: ${{ secrets.API_TOKEN }} }` on the check step.
 
 ## What it does not do
 
 - It checks the **top-level** shape of JSON responses. It does not validate nested objects, formats, or ranges.
 - Rename hints are heuristics (same type, not in the contract). A human should confirm them.
-- It sends no credentials. For private APIs, point it at a gateway or proxy that adds auth on your side.
+- It sends only the headers you list in a contract. It does not log in, refresh tokens, or handle OAuth flows. For those, put a token in an environment variable and reference it.
 
 ## Development
 

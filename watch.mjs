@@ -16,7 +16,8 @@
  * Usage:
  *   api-watch check contracts.json [--json out.json] [--md out.md]
  *                  [--timeout 10000] [--fail-on breaking|warning]
- *   api-watch init <name> <url> [--out contracts.json]
+ *   api-watch init <name> <url> [--out contracts.json] [--header "Name: ${ENV_VAR}"]...
+ *                  (secrets stay in the environment; contracts.json stores only ${VAR} placeholders)
  *
  * Exit: 0 clean · 1 breaking (or warning when --fail-on warning) · 2 bad input
  */
@@ -30,6 +31,45 @@ export function typeOf(v) {
   if (v === null) return 'null';
   if (Array.isArray(v)) return 'array';
   return typeof v;
+}
+
+// Header names that usually carry credentials. init refuses to save literal values for these.
+const SECRET_HEADER = /authorization|cookie|token|secret|api-?key|key$/i;
+
+/** Replace ${VAR} with environment values. Reports variables that are unset or empty. */
+export function expandEnv(template, env = process.env) {
+  const missing = [];
+  const value = template.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (_, name) => {
+    if (env[name] === undefined || env[name] === '') {
+      missing.push(name);
+      return '';
+    }
+    return env[name];
+  });
+  return { value, missing };
+}
+
+/** Build request headers from contract templates. Always sends Accept: application/json. */
+export function resolveHeaders(templates = {}, env = process.env) {
+  const headers = { accept: 'application/json' };
+  const missing = [];
+  for (const [name, template] of Object.entries(templates)) {
+    const r = expandEnv(template, env);
+    headers[name] = r.value;
+    for (const variable of r.missing) missing.push({ header: name, variable });
+  }
+  return { headers, missing };
+}
+
+/** "Name: value" strings to an object, split on the first colon. Returns null if any entry is malformed. */
+export function parseHeaderArgs(list) {
+  const out = {};
+  for (const h of list) {
+    const i = h.indexOf(':');
+    if (i < 1) return null;
+    out[h.slice(0, i).trim()] = h.slice(i + 1).trim();
+  }
+  return out;
 }
 
 /** Find same-typed fields in the response that the contract does not expect. */
@@ -83,11 +123,20 @@ export function checkBody(contract, status, headers, body) {
   return findings;
 }
 
-export async function checkEndpoint(contract, fetchImpl = fetch, timeoutMs = DEFAULT_TIMEOUT_MS) {
+export async function checkEndpoint(contract, fetchImpl = fetch, timeoutMs = DEFAULT_TIMEOUT_MS, env = process.env) {
+  const { headers, missing } = resolveHeaders(contract.headers, env);
+  if (missing.length) {
+    return {
+      name: contract.name,
+      url: contract.url,
+      status: null,
+      findings: missing.map((m) => ({ level: 'BREAKING', message: `missing environment variable ${m.variable} for header "${m.header}"; request not sent` })),
+    };
+  }
   let res;
   try {
     res = await fetchImpl(contract.url, {
-      headers: { accept: 'application/json' },
+      headers,
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (e) {
@@ -126,7 +175,7 @@ export async function runWatch(contracts, fetchImpl = fetch, timeoutMs = DEFAULT
  * Derive a contract from a live response. Top-level keys of an object, or the
  * keys of the first element of an array, become expected fields with their types.
  */
-export function deriveContract(name, url, status, body) {
+export function deriveContract(name, url, status, body, headers = {}) {
   const isArray = Array.isArray(body);
   const sample = isArray ? body[0] : body;
   const fields = {};
@@ -136,7 +185,9 @@ export function deriveContract(name, url, status, body) {
   const expect = { status };
   if (isArray) expect.array = true;
   expect.fields = fields;
-  return { name, url, expect };
+  const contract = { name, url, expect };
+  if (Object.keys(headers).length) contract.headers = headers;
+  return contract;
 }
 
 export function toMarkdown(report) {
@@ -160,7 +211,7 @@ function usage() {
   return [
     'usage:',
     '  api-watch check contracts.json [--json out.json] [--md out.md] [--timeout ms] [--fail-on breaking|warning]',
-    '  api-watch init <name> <url> [--out contracts.json]',
+    '  api-watch init <name> <url> [--out contracts.json] [--header "Name: ${ENV_VAR}"]...',
   ].join('\n');
 }
 
@@ -172,6 +223,7 @@ async function main(argv) {
       json: { type: 'string' },
       md: { type: 'string' },
       out: { type: 'string' },
+      header: { type: 'string', multiple: true },
       timeout: { type: 'string', default: String(DEFAULT_TIMEOUT_MS) },
       'fail-on': { type: 'string', default: 'breaking' },
       help: { type: 'boolean', short: 'h' },
@@ -189,9 +241,24 @@ async function main(argv) {
       console.error(usage());
       return setExit(2);
     }
+    const templates = parseHeaderArgs(values.header ?? []);
+    if (!templates) {
+      console.error('--header must look like "Name: value"');
+      return setExit(2);
+    }
+    const secret = Object.entries(templates).find(([k, v]) => SECRET_HEADER.test(k) && !v.includes('${'));
+    if (secret) {
+      console.error(`init: refusing to save a literal value for "${secret[0]}" in contracts.json; use \${ENV_VAR} instead`);
+      return setExit(2);
+    }
+    const resolved = resolveHeaders(templates);
+    if (resolved.missing.length) {
+      console.error(`init: missing environment variable ${resolved.missing[0].variable} for header "${resolved.missing[0].header}"`);
+      return setExit(1);
+    }
     let res;
     try {
-      res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(Number(values.timeout)) });
+      res = await fetch(url, { headers: resolved.headers, signal: AbortSignal.timeout(Number(values.timeout)) });
     } catch (e) {
       console.error(`init: cannot reach ${url}: ${e.message}`);
       return setExit(1);
@@ -203,7 +270,7 @@ async function main(argv) {
       console.error(`init: ${url} did not return JSON (status ${res.status})`);
       return setExit(1);
     }
-    const contract = deriveContract(name, url, res.status, body);
+    const contract = deriveContract(name, url, res.status, body, templates);
     const outFile = values.out ?? 'contracts.json';
     const list = existsSync(outFile) ? JSON.parse(readFileSync(outFile, 'utf8')) : [];
     const next = [...list.filter((c) => c.name !== name), contract];

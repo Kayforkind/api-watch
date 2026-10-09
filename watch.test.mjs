@@ -7,14 +7,14 @@ import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runWatch, checkBody, deriveContract, checkEndpoint } from './watch.mjs';
+import { runWatch, checkBody, deriveContract, checkEndpoint, expandEnv, parseHeaderArgs, DEFAULT_TIMEOUT_MS } from './watch.mjs';
 
 const run = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
 const CLI = join(here, 'watch.mjs');
 // Async on purpose: a sync child would block this process's fixture server.
-const cli = (args) =>
-  run(process.execPath, [CLI, ...args], { encoding: 'utf8' }).then(
+const cli = (args, env = process.env) =>
+  run(process.execPath, [CLI, ...args], { encoding: 'utf8', env }).then(
     (r) => ({ status: 0, stdout: r.stdout, stderr: r.stderr }),
     (e) => ({ status: e.code, stdout: e.stdout ?? '', stderr: e.stderr ?? '' }),
   );
@@ -78,6 +78,14 @@ before(async () => {
       res.writeHead(200, { 'content-type': 'text/html' });
       return res.end('<html></html>');
     }
+    if (req.url === '/auth') {
+      if (req.headers.authorization !== 'Bearer t0k') {
+        res.writeHead(401);
+        return res.end();
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ id: 1 }));
+    }
     if (req.url === '/slow') {
       return; // never respond
     }
@@ -133,4 +141,62 @@ test('CLI: check exits 1 on breaking change and 2 on a bad contracts file', asyn
   assert.equal(JSON.parse(readFileSync(join(dir, 'report.json'), 'utf8')).counts.BREAKING, 1);
   writeFileSync(file, '{"not":"an array"}');
   assert.equal((await cli(['check', file])).status, 2);
+});
+
+test('expandEnv substitutes ${VAR} and reports missing variables', () => {
+  assert.deepEqual(expandEnv('Bearer ${T}', { T: 'abc' }), { value: 'Bearer abc', missing: [] });
+  assert.deepEqual(expandEnv('Bearer ${T}', {}), { value: 'Bearer ', missing: ['T'] });
+});
+
+test('parseHeaderArgs splits on the first colon and rejects malformed headers', () => {
+  assert.deepEqual(parseHeaderArgs(['Authorization: Bearer ${T}']), { Authorization: 'Bearer ${T}' });
+  assert.equal(parseHeaderArgs(['no-colon']), null);
+});
+
+test('checkEndpoint sends the auth header expanded from the environment', async () => {
+  const e = await checkEndpoint(
+    { name: 'secure', url: base + '/auth', headers: { Authorization: 'Bearer ${API_TOKEN}' }, expect: { status: 200, fields: { id: 'number' } } },
+    fetch,
+    DEFAULT_TIMEOUT_MS,
+    { API_TOKEN: 't0k' },
+  );
+  assert.equal(e.status, 200);
+  assert.deepEqual(e.findings, []);
+});
+
+test('a missing secret stops the check before any request is sent', async () => {
+  let called = false;
+  const spy = async () => {
+    called = true;
+    return new Response('{}');
+  };
+  const e = await checkEndpoint(
+    { name: 'secure', url: base + '/auth', headers: { Authorization: 'Bearer ${API_TOKEN}' }, expect: {} },
+    spy,
+    DEFAULT_TIMEOUT_MS,
+    {},
+  );
+  assert.equal(called, false);
+  assert.equal(e.status, null);
+  assert.match(e.findings[0].message, /missing environment variable API_TOKEN/);
+});
+
+test('CLI: init stores the header as a placeholder, never the secret, and check then passes', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'apiwatch-'));
+  const file = join(dir, 'contracts.json');
+  const env = { ...process.env, API_TOKEN: 't0k' };
+  const init = await cli(['init', 'secure', base + '/auth', '--out', file, '--header', 'Authorization: Bearer ${API_TOKEN}'], env);
+  assert.equal(init.status, 0, init.stderr);
+  const raw = readFileSync(file, 'utf8');
+  assert.ok(raw.includes('Bearer ${API_TOKEN}'));
+  assert.ok(!raw.includes('t0k'), 'the secret must not be written to the contracts file');
+  const r = await cli(['check', file], env);
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+});
+
+test('CLI: init refuses to save a literal secret in a credential header', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'apiwatch-'));
+  const r = await cli(['init', 'secure', base + '/ok', '--out', join(dir, 'c.json'), '--header', 'Authorization: Bearer t0k']);
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /refusing to save a literal value/);
 });

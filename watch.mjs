@@ -309,5 +309,9 @@ async function main(argv) {
 }
 
 if (process.argv[1]?.endsWith('watch.mjs')) {
-  main(process.argv.slice(2));
+  // Usage errors (e.g. unknown flags) exit 2 with a one-line message, never a stack trace.
+  main(process.argv.slice(2)).catch((e) => {
+    console.error(e.message);
+    setExit(2);
+  });
 }

@@ -1,0 +1,11 @@
+{
+  "name": "api-watch",
+  "version": "0.2.0",
+  "description": "Catch breaking API changes before your users do. Snapshot response contracts, check them in CI, get rename hints.",
+  "type": "module",
+  "bin": { "api-watch": "watch.mjs" },
+  "scripts": { "test": "node --test watch.test.mjs" },
+  "engines": { "node": ">=20" },
+  "keywords": ["api", "contract-testing", "deprecation", "breaking-changes", "ci"],
+  "license": "MIT"
+}

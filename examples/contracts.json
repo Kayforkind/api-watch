@@ -1,0 +1,15 @@
+[
+  {
+    "name": "jsonplaceholder-todo",
+    "url": "https://jsonplaceholder.typicode.com/todos/1",
+    "expect": {
+      "status": 200,
+      "fields": {
+        "userId": "number",
+        "id": "number",
+        "title": "string",
+        "completed": "boolean"
+      }
+    }
+  }
+]

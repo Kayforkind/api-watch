@@ -7,7 +7,7 @@ import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runWatch, checkBody, deriveContract, checkEndpoint, expandEnv, parseHeaderArgs, DEFAULT_TIMEOUT_MS } from './watch.mjs';
+import { runWatch, checkBody, deriveContract, checkEndpoint, expandEnv, parseHeaderArgs, DEFAULT_TIMEOUT_MS, validateContracts, MAX_RESPONSE_BYTES, toMarkdown } from './watch.mjs';
 
 const run = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -86,6 +86,15 @@ before(async () => {
       res.writeHead(200, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ id: 1 }));
     }
+    if (req.url === '/redirect') {
+      res.writeHead(302, { location: base + '/auth' });
+      return res.end();
+    }
+    if (req.url === '/body-slow') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.write('{');
+      return;
+    }
     if (req.url === '/slow') {
       return; // never respond
     }
@@ -95,7 +104,39 @@ before(async () => {
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   base = `http://127.0.0.1:${server.address().port}`;
 });
-after(() => new Promise((r) => server.close(r)));
+after(() => { server.closeAllConnections(); return new Promise((r) => server.close(r)); });
+
+test('redirects and stalled bodies fail without hanging or forwarding credentials', async () => {
+  const redirected = await checkEndpoint({ name: 'r', url: base + '/redirect', expect: {} });
+  assert.equal(redirected.status, null);
+  const slow = await checkEndpoint({ name: 's', url: base + '/body-slow', expect: {} }, fetch, 150);
+  assert.equal(slow.status, null);
+  assert.match(slow.findings[0].message, /150 ms/);
+});
+
+test('oversized responses fail and invalid configuration makes no request', async () => {
+  const c = { name: 'x', url: base + '/ok', expect: {} };
+  const r = await checkEndpoint(c, async () => new Response('x'.repeat(MAX_RESPONSE_BYTES + 1)));
+  assert.match(r.findings[0].message, /2 MiB/);
+  for (const value of [[], [null], [{ ...c, url: 'file:///etc/passwd' }], [{ ...c, url: 'https://x/?api_key=secret' }], [{ ...c, headers: { Authorization: 'literal ${TOKEN}' } }], [{ ...c, expect: { fields: { x: 'nonsense' } } }]]) assert.throws(() => validateContracts(value));
+});
+
+test('prototype names are own fields and Markdown cannot inject raw HTML', () => {
+  const findings = checkBody({ expect: { fields: { constructor: 'string' } } }, 200, headers(), {});
+  assert.match(findings[0].message, /missing field/);
+  const r = toMarkdown({ checkedAt: 'now', counts: { BREAKING: 1, WARNING: 0, INFO: 0 }, endpoints: [{ name: '<script>x</script>', status: 200, findings: [{ level: 'BREAKING', message: '<img onerror=x>' }] }] });
+  assert.ok(!r.includes('<script>') && !r.includes('<img'));
+});
+
+test('CLI rejects invalid timeouts and report overwrite of input', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'apiwatch-security-'));
+  const file = join(dir, 'c.json');
+  const original = JSON.stringify([{ name: 'x', url: base + '/ok', expect: {} }]);
+  writeFileSync(file, original);
+  assert.equal((await cli(['check', file, '--timeout', '-1'])).status, 2);
+  assert.equal((await cli(['check', file, '--json', file])).status, 2);
+  assert.equal(readFileSync(file, 'utf8'), original);
+});
 
 test('runWatch reports status, rename hints, and counts across endpoints', async () => {
   const report = await runWatch([

@@ -1,11 +1,31 @@
 {
   "name": "api-watch",
-  "version": "0.2.0",
-  "description": "Catch breaking API changes before your users do. Snapshot response contracts, check them in CI, get rename hints.",
+  "version": "0.2.2",
+  "description": "API response contract checks with safe secret references, bounded requests and CI reports.",
   "type": "module",
-  "bin": { "api-watch": "watch.mjs" },
-  "scripts": { "test": "node --test watch.test.mjs" },
-  "engines": { "node": ">=20" },
-  "keywords": ["api", "contract-testing", "deprecation", "breaking-changes", "ci"],
-  "license": "MIT"
+  "bin": {
+    "api-watch": "watch.mjs"
+  },
+  "scripts": {
+    "test": "node --test watch.test.mjs",
+    "verify": "node --check watch.mjs && npm test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "api",
+    "contract-testing",
+    "deprecation",
+    "breaking-changes",
+    "ci"
+  ],
+  "license": "MIT",
+  "files": [
+    "watch.mjs",
+    "examples/",
+    "demo/",
+    "SECURITY.md",
+    "LICENSE"
+  ]
 }

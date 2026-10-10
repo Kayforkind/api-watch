@@ -21,11 +21,74 @@
  *
  * Exit: 0 clean · 1 breaking (or warning when --fail-on warning) · 2 bad input
  */
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, statSync, realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 
 export const SUNSET_WINDOW_DAYS = 60;
 export const DEFAULT_TIMEOUT_MS = 10000;
+export const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+const plain = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const own = (o, k) => Object.hasOwn(o, k);
+function readContracts(file) {
+  if (!statSync(file).isFile() || statSync(file).size > 2 * 1024 * 1024) throw new Error('contracts input must be a regular file under 2 MiB');
+  return validateContracts(JSON.parse(readFileSync(file, 'utf8')));
+}
+const safeText = (v) => String(v).replace(/[\x00-\x1f\x7f]/g, ' ').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]).replace(/([\\`*_\[\]])/g, '\\$1');
+
+function validateUrl(value) {
+  const url = new URL(value);
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('URL must be HTTP(S) without embedded credentials');
+  if ([...url.searchParams.keys()].some((key) => SECRET_HEADER.test(key))) throw new Error('credentials must be in environment-backed headers, not URL query parameters');
+  return url;
+}
+
+function timeoutValue(ms) {
+  if (!Number.isSafeInteger(ms) || ms <= 0 || ms > 2147483647) throw new Error('timeout must be a positive integer at most 2147483647');
+  return ms;
+}
+
+function validateTemplates(templates = {}) {
+  if (!plain(templates)) throw new Error('headers must be an object');
+  for (const [name, value] of Object.entries(templates)) {
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) || typeof value !== 'string' || /[\r\n\x00]/.test(value)) throw new Error('invalid header template');
+    if (SECRET_HEADER.test(name) && !/^(?:Bearer |Basic )?\$\{[A-Z_][A-Z0-9_]*\}$/.test(value)) throw new Error(`refusing to save a literal value for "${name}"; use an environment placeholder`);
+  }
+}
+
+export function validateContracts(contracts) {
+  if (!Array.isArray(contracts) || contracts.length === 0 || contracts.length > 100) throw new Error('contracts must be a nonempty array of at most 100 entries');
+  const names = new Set();
+  for (const c of contracts) {
+    if (!plain(c) || typeof c.name !== 'string' || !c.name.trim() || names.has(c.name) || typeof c.url !== 'string' || !plain(c.expect)) throw new Error('invalid or duplicate contract');
+    names.add(c.name);
+    validateUrl(c.url);
+    validateTemplates(c.headers);
+    if (c.expect.status !== undefined && (!Number.isInteger(c.expect.status) || c.expect.status < 100 || c.expect.status > 599)) throw new Error('invalid expected status');
+    if (c.expect.array !== undefined && typeof c.expect.array !== 'boolean') throw new Error('array must be boolean');
+    if (c.expect.fields !== undefined && (!plain(c.expect.fields) || Object.values(c.expect.fields).some((t) => !['string', 'number', 'boolean', 'object', 'array', 'null'].includes(t)))) throw new Error('invalid expected fields');
+  }
+  return contracts;
+}
+
+async function boundedText(res) {
+  if (Number(res.headers.get('content-length')) > MAX_RESPONSE_BYTES) { await res.body?.cancel(); throw new Error('response exceeds 2 MiB limit'); }
+  if (!res.body) return '';
+  const reader = res.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_RESPONSE_BYTES) { await reader.cancel(); throw new Error('response exceeds 2 MiB limit'); }
+      chunks.push(value);
+    }
+  } finally { reader.releaseLock(); }
+  return Buffer.concat(chunks).toString('utf8');
+}
 
 export function typeOf(v) {
   if (v === null) return 'null';
@@ -51,11 +114,13 @@ export function expandEnv(template, env = process.env) {
 
 /** Build request headers from contract templates. Always sends Accept: application/json. */
 export function resolveHeaders(templates = {}, env = process.env) {
+  validateTemplates(templates);
   const headers = { accept: 'application/json' };
   const missing = [];
   for (const [name, template] of Object.entries(templates)) {
     const r = expandEnv(template, env);
-    headers[name] = r.value;
+    if (/[\r\n\x00]/.test(r.value)) throw new Error('invalid expanded header value');
+    Object.defineProperty(headers, name, { value: r.value, enumerable: true });
     for (const variable of r.missing) missing.push({ header: name, variable });
   }
   return { headers, missing };
@@ -67,7 +132,7 @@ export function parseHeaderArgs(list) {
   for (const h of list) {
     const i = h.indexOf(':');
     if (i < 1) return null;
-    out[h.slice(0, i).trim()] = h.slice(i + 1).trim();
+    Object.defineProperty(out, h.slice(0, i).trim(), { value: h.slice(i + 1).trim(), enumerable: true, configurable: true });
   }
   return out;
 }
@@ -76,7 +141,7 @@ export function parseHeaderArgs(list) {
 function renameHints(missingName, missingType, body, expectedFields) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return [];
   return Object.keys(body)
-    .filter((k) => !(k in expectedFields) && typeOf(body[k]) === missingType)
+    .filter((k) => !own(expectedFields, k) && typeOf(body[k]) === missingType)
     .map((k) => `"${k}" (${missingType}) may be the renamed "${missingName}"`);
 }
 
@@ -107,7 +172,7 @@ export function checkBody(contract, status, headers, body) {
 
   const fields = expect.fields ?? {};
   for (const [name, wantType] of Object.entries(fields)) {
-    if (!probe || typeof probe !== 'object' || !(name in probe)) {
+    if (!probe || typeof probe !== 'object' || !own(probe, name)) {
       const hints = renameHints(name, wantType, probe, fields);
       add('BREAKING', `missing field "${name}" (${wantType})` + (hints.length ? `; hint: ${hints.join('; ')}` : ''));
       continue;
@@ -117,13 +182,17 @@ export function checkBody(contract, status, headers, body) {
   }
 
   if (probe && typeof probe === 'object' && !Array.isArray(probe)) {
-    const extra = Object.keys(probe).filter((k) => !(k in fields));
+    const extra = Object.keys(probe).filter((k) => !own(fields, k));
     if (extra.length) add('INFO', `new fields not in contract: ${extra.join(', ')}`);
   }
   return findings;
 }
 
 export async function checkEndpoint(contract, fetchImpl = fetch, timeoutMs = DEFAULT_TIMEOUT_MS, env = process.env) {
+  validateContracts([contract]);
+  timeoutValue(timeoutMs);
+  const url = validateUrl(contract.url);
+  if (url.protocol === 'http:' && !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) && Object.keys(contract.headers ?? {}).some((k) => SECRET_HEADER.test(k))) throw new Error('credential headers require HTTPS (except loopback tests)');
   const { headers, missing } = resolveHeaders(contract.headers, env);
   if (missing.length) {
     return {
@@ -134,16 +203,18 @@ export async function checkEndpoint(contract, fetchImpl = fetch, timeoutMs = DEF
     };
   }
   let res;
+  let text;
   try {
     res = await fetchImpl(contract.url, {
       headers,
+      redirect: 'error',
       signal: AbortSignal.timeout(timeoutMs),
     });
+    text = await boundedText(res);
   } catch (e) {
-    const reason = e?.name === 'TimeoutError' ? `no response within ${timeoutMs} ms` : e.message;
+    const reason = ['TimeoutError', 'AbortError'].includes(e?.name) ? `no response within ${timeoutMs} ms` : (e.message === 'response exceeds 2 MiB limit' ? e.message : 'request or response failed');
     return { name: contract.name, url: contract.url, status: null, findings: [{ level: 'BREAKING', message: `unreachable: ${reason}` }] };
   }
-  const text = await res.text();
   let body = null;
   try {
     body = text ? JSON.parse(text) : null;
@@ -164,6 +235,8 @@ export async function checkEndpoint(contract, fetchImpl = fetch, timeoutMs = DEF
 }
 
 export async function runWatch(contracts, fetchImpl = fetch, timeoutMs = DEFAULT_TIMEOUT_MS) {
+  validateContracts(contracts);
+  timeoutValue(timeoutMs);
   const endpoints = [];
   for (const c of contracts) endpoints.push(await checkEndpoint(c, fetchImpl, timeoutMs));
   const counts = { BREAKING: 0, WARNING: 0, INFO: 0 };
@@ -180,7 +253,7 @@ export function deriveContract(name, url, status, body, headers = {}) {
   const sample = isArray ? body[0] : body;
   const fields = {};
   if (sample && typeof sample === 'object' && !Array.isArray(sample)) {
-    for (const [k, v] of Object.entries(sample)) fields[k] = typeOf(v);
+    for (const [k, v] of Object.entries(sample)) Object.defineProperty(fields, k, { value: typeOf(v), enumerable: true });
   }
   const expect = { status };
   if (isArray) expect.array = true;
@@ -193,9 +266,9 @@ export function deriveContract(name, url, status, body, headers = {}) {
 export function toMarkdown(report) {
   const lines = [`# API watch — ${report.checkedAt}`, '', `Breaking: ${report.counts.BREAKING} · Warnings: ${report.counts.WARNING} · Info: ${report.counts.INFO}`, ''];
   for (const e of report.endpoints) {
-    lines.push(`## ${e.name} (${e.status ?? 'no response'})`);
+    lines.push(`## ${safeText(e.name)} (${e.status ?? 'no response'})`);
     if (e.findings.length === 0) lines.push('- no changes');
-    for (const f of e.findings) lines.push(`- **${f.level}** ${f.message}`);
+    for (const f of e.findings) lines.push(`- **${f.level}** ${safeText(f.message)}`);
     lines.push('');
   }
   return lines.join('\n');
@@ -234,10 +307,11 @@ async function main(argv) {
     return setExit(values.help ? 0 : 2);
   }
   const [command, ...rest] = positionals;
+  const timeout = timeoutValue(Number(values.timeout));
 
   if (command === 'init') {
     const [name, url] = rest;
-    if (!name || !url) {
+    if (!name || !url || rest.length !== 2) {
       console.error(usage());
       return setExit(2);
     }
@@ -246,6 +320,8 @@ async function main(argv) {
       console.error('--header must look like "Name: value"');
       return setExit(2);
     }
+    validateUrl(url);
+    validateTemplates(templates);
     const secret = Object.entries(templates).find(([k, v]) => SECRET_HEADER.test(k) && !v.includes('${'));
     if (secret) {
       console.error(`init: refusing to save a literal value for "${secret[0]}" in contracts.json; use \${ENV_VAR} instead`);
@@ -258,23 +334,26 @@ async function main(argv) {
     }
     let res;
     try {
-      res = await fetch(url, { headers: resolved.headers, signal: AbortSignal.timeout(Number(values.timeout)) });
+      const target = validateUrl(url);
+      if (target.protocol === 'http:' && !['localhost', '127.0.0.1', '[::1]'].includes(target.hostname) && Object.keys(templates).some((k) => SECRET_HEADER.test(k))) throw new Error('credential headers require HTTPS');
+      res = await fetch(url, { headers: resolved.headers, redirect: 'error', signal: AbortSignal.timeout(timeout) });
     } catch (e) {
-      console.error(`init: cannot reach ${url}: ${e.message}`);
+      console.error('init: request failed (redirects and insecure credential transport are refused)');
       return setExit(1);
     }
     let body;
     try {
-      body = JSON.parse(await res.text());
+      body = JSON.parse(await boundedText(res));
     } catch {
       console.error(`init: ${url} did not return JSON (status ${res.status})`);
       return setExit(1);
     }
     const contract = deriveContract(name, url, res.status, body, templates);
     const outFile = values.out ?? 'contracts.json';
-    const list = existsSync(outFile) ? JSON.parse(readFileSync(outFile, 'utf8')) : [];
+    const list = existsSync(outFile) ? readContracts(outFile) : [];
     const next = [...list.filter((c) => c.name !== name), contract];
-    writeFileSync(outFile, JSON.stringify(next, null, 2) + '\n');
+    validateContracts(next);
+    writeFileSync(outFile, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 });
     console.log(`wrote contract "${name}" (${Object.keys(contract.expect.fields).length} field(s)) to ${outFile}`);
     return setExit(0);
   }
@@ -294,24 +373,27 @@ async function main(argv) {
   }
   let contracts;
   try {
-    contracts = JSON.parse(readFileSync(file, 'utf8'));
-    if (!Array.isArray(contracts)) throw new Error('contracts file must be a JSON array');
+    contracts = readContracts(file);
   } catch (e) {
     console.error(`bad contracts file: ${e.message}`);
     return setExit(2);
   }
-  const report = await runWatch(contracts, fetch, Number(values.timeout));
-  if (values.json) writeFileSync(values.json, JSON.stringify(report, null, 2) + '\n');
-  if (values.md) writeFileSync(values.md, toMarkdown(report));
+  const outputs = [values.json, values.md].filter(Boolean);
+  const targets = outputs.map((p) => existsSync(p) ? realpathSync(p) : resolve(p));
+  if (targets.includes(realpathSync(file)) || new Set(targets).size !== targets.length) throw new Error('report paths must differ from input and each other');
+  if (outputs.some((p) => existsSync(p))) throw new Error('report output already exists; choose a new filename');
+  const report = await runWatch(contracts, fetch, timeout);
+  if (values.json) writeFileSync(values.json, JSON.stringify(report, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+  if (values.md) writeFileSync(values.md, toMarkdown(report), { flag: 'wx', mode: 0o600 });
   console.log(toMarkdown(report));
   const failing = report.counts.BREAKING > 0 || (values['fail-on'] === 'warning' && report.counts.WARNING > 0);
   return setExit(failing ? 1 : 0);
 }
 
-if (process.argv[1]?.endsWith('watch.mjs')) {
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
   // Usage errors (e.g. unknown flags) exit 2 with a one-line message, never a stack trace.
   main(process.argv.slice(2)).catch((e) => {
-    console.error(e.message);
+    console.error(String(e.message).replace(/[\r\n\x1b]/g, ' '));
     setExit(2);
   });
 }

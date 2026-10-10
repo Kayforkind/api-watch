@@ -1,4 +1,6 @@
-# api-watch
+# api-watch 0.2.2
+
+> Contract checks with environment-backed credentials, redirects refused, bounded responses, and secret-safe reports.
 
 **Know about the API change before your users do.**
 
@@ -91,6 +93,14 @@ node watch.mjs init me https://api.example.com/me --header 'Authorization: Beare
 
 `.github/workflows/api-watch.yml` runs the check every morning and uploads the report as an artifact. The job fails only on breaking changes by default. For private APIs, pass credentials from repository secrets as environment variables, for example `env: { API_TOKEN: ${{ secrets.API_TOKEN }} }` on the check step.
 
+## Security boundaries
+
+- Contracts are trusted network configuration: requests may target private or loopback services. Do not offer this CLI as a public URL-fetching service without a separate SSRF/DNS/network-egress policy.
+- Redirects are refused so custom credential headers cannot follow a redirect to another origin. Credentials require HTTPS, except loopback development fixtures.
+- Credential headers accept only an entire `${VAR}` placeholder, optionally prefixed with `Bearer ` or `Basic `. Literal credentials, embedded URL credentials, credential query parameters and header control characters are refused. Arbitrary secrets disguised under unrelated names cannot be detected.
+- Response bodies are limited to 2 MiB and the timeout covers reading the body. Contract arrays must contain 1–100 valid, uniquely named entries; invalid configurations fail before network access.
+- Report paths cannot overwrite the contract input or each other. Markdown escapes remote HTML/control characters. Store reports privately: URLs and field names may still be sensitive.
+
 ## What it does not do
 
 - It checks the **top-level** shape of JSON responses. It does not validate nested objects, formats, or ranges.
@@ -108,3 +118,7 @@ Tests run against a local fixture server, so they need no network access.
 ## License
 
 MIT
+
+## Release verification
+
+Use a supported Node LTS (22 or 24). Run `npm ci --ignore-scripts` followed by `npm run verify`. The security workflow runs the regression suite on Linux and Windows; it has not yet been executed remotely for this local change. New report/output files are created exclusively; choose fresh filenames or output folders for repeat runs. See [SECURITY.md](SECURITY.md) for the threat model and disclosure guidance.
